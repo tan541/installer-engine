@@ -20,16 +20,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_dir = work_dir.path().join("download_cache");
     let audit_log_path = work_dir.path().join("endpoint_audit.log");
 
-    // 3. Create a sample distribution payload file
-    let mut sample_payload = NamedTempFile::new()?;
-    let binary_bytes = b"MS_TEAMS_SIMULATED_INSTALLER_BINARY_V1.5.0";
-    sample_payload.write_all(binary_bytes)?;
-    sample_payload.flush()?;
+    // 3. Prepare distribution payload (use ShieldNet 360 package if present)
+    let shieldnet_pkg_path = std::path::Path::new("data/ShieldNet 360-1.6.0-arm64.pkg");
+    let (app_name, app_version, payload_url, sha256_checksum) = if shieldnet_pkg_path.exists() {
+        let abs_path = std::fs::canonicalize(shieldnet_pkg_path)?;
+        let hash = ChecksumVerifier::compute_sha256(&abs_path)?;
+        (
+            "ShieldNet 360".to_string(),
+            Some("1.6.0".to_string()),
+            format!("file://{}", abs_path.display()),
+            hash,
+        )
+    } else {
+        let mut sample_payload = NamedTempFile::new()?;
+        let binary_bytes = b"MS_TEAMS_SIMULATED_INSTALLER_BINARY_V1.5.0";
+        sample_payload.write_all(binary_bytes)?;
+        sample_payload.flush()?;
+        let hash = ChecksumVerifier::compute_bytes_sha256(binary_bytes);
+        (
+            "Microsoft Teams".to_string(),
+            Some("1.5.0".to_string()),
+            format!("file://{}", sample_payload.path().display()),
+            hash,
+        )
+    };
 
-    let sha256_checksum = ChecksumVerifier::compute_bytes_sha256(binary_bytes);
-    let payload_url = format!("file://{}", sample_payload.path().display());
-
-    println!("[1] Sample Payload Prepared:");
+    println!("[1] Distribution Payload Prepared:");
+    println!("    - App:        {} (v{})", app_name, app_version.as_deref().unwrap_or("latest"));
     println!("    - Source URL: {}", payload_url);
     println!("    - SHA-256:    {}\n", sha256_checksum);
 
@@ -39,8 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         group_policy_id: 101,
         org_id: 1,
         group_type: "distribute.app".to_string(),
-        app_name: "Microsoft Teams".to_string(),
-        app_version: Some("1.5.0".to_string()),
+        app_name,
+        app_version,
         download_url: payload_url,
         checksum_sha256: sha256_checksum,
         target_platforms: vec![Platform::MacOS, Platform::Linux, Platform::Windows],

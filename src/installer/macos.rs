@@ -38,6 +38,25 @@ impl MacOSInstaller {
         }
     }
 
+    pub fn extract_app_name_from_pkg(package_path: &Path) -> Option<String> {
+        let output = Command::new("pkgutil")
+            .arg("--payload-files")
+            .arg(package_path)
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim().trim_start_matches("./");
+                if trimmed.ends_with(".app") && !trimmed.contains('/') {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
     fn install_pkg(&self, package_path: &Path, user_args: &[String], start: Instant) -> Result<InstallReport> {
         let mut cmd = Command::new("/usr/sbin/installer");
         cmd.arg("-pkg").arg(package_path);
@@ -54,11 +73,15 @@ impl MacOSInstaller {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if output.status.success() {
+            let installed_path = Self::extract_app_name_from_pkg(package_path)
+                .map(|app_name| format!("/Applications/{}", app_name))
+                .unwrap_or_else(|| "/Applications".to_string());
+
             Ok(InstallReport {
                 success: true,
                 exit_code: output.status.code(),
                 message: String::from_utf8_lossy(&output.stdout).to_string(),
-                installed_path: Some("/Applications".to_string()),
+                installed_path: Some(installed_path),
                 duration_ms,
             })
         } else {

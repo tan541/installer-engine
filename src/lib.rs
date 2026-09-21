@@ -17,4 +17,4 @@ pub use error::{EngineError, Result};
 pub use installer::{create_installer, Installer, MockInstaller, PlatformInstaller};
 pub use logging::init_logger;
 pub use models::{GroupPolicy, InstallReport, Platform, Task, TaskStatus, TaskType};
-pub use verifier::ChecksumVerifier;
+pub use verifier::{AppInstallationVerifier, ChecksumVerifier};
