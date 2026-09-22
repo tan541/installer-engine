@@ -14,13 +14,22 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-/// Checks if current process is running with root privileges (UID 0)
+/// Checks if current process is running with root / elevated administrator privileges
 fn is_running_as_root() -> bool {
     #[cfg(unix)]
     unsafe {
         geteuid() == 0
     }
     #[cfg(windows)]
+    {
+        // On Windows, 'net session' exits with 0 only if running with elevated Administrator privileges
+        std::process::Command::new("cmd")
+            .args(["/c", "net session >nul 2>&1"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -36,6 +45,9 @@ struct AgentCliOptions {
     one_shot: bool,
     allow_non_root: bool,
     local_pkg: Option<PathBuf>,
+    inventory: bool,
+    json_output: bool,
+    sync_inventory: bool,
 }
 
 impl AgentCliOptions {
@@ -51,6 +63,9 @@ impl AgentCliOptions {
         let mut one_shot = false;
         let mut allow_non_root = false;
         let mut local_pkg = None;
+        let mut inventory = false;
+        let mut json_output = false;
+        let mut sync_inventory = false;
 
         let is_root = is_running_as_root();
         let default_cache_dir = if is_root {
@@ -147,6 +162,15 @@ impl AgentCliOptions {
                 "--allow-non-root" | "--skip-root-check" => {
                     allow_non_root = true;
                 }
+                "--inventory" | "-i" => {
+                    inventory = true;
+                }
+                "--json" => {
+                    json_output = true;
+                }
+                "--sync-inventory" => {
+                    sync_inventory = true;
+                }
                 "--pkg" | "--local-pkg" => {
                     i += 1;
                     if i >= args.len() {
@@ -171,6 +195,9 @@ impl AgentCliOptions {
             one_shot,
             allow_non_root,
             local_pkg,
+            inventory,
+            json_output,
+            sync_inventory,
         })
     }
 }
@@ -205,6 +232,9 @@ DESCRIPTION:
     verifies packages (SHA-256), and executes native silent installations.
 
 OPTIONS:
+    -i, --inventory             Scan and list all installed applications and metadata on this device
+    --json                      Output inventory scan results as JSON
+    --sync-inventory            Scan and synchronize installed applications directly with Control Plane
     --pkg <PATH>                Run immediate local package installation workflow (e.g. data/ShieldNet 360-1.6.0-arm64.pkg)
     --org-id <NUM>              Organization ID (default: 1)
     --device-id <ID>            Device identifier (default: endpoint-<hostname>)
@@ -233,27 +263,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    println!("============================================================");
-    println!("     Installer Engine Native Endpoint Agent Daemon          ");
-    println!("============================================================");
+    if !opts.json_output {
+        println!("============================================================");
+        println!("     Installer Engine Native Endpoint Agent Daemon          ");
+        println!("============================================================");
+    }
 
-    // 2. Root Privilege Check
-    let is_root = is_running_as_root();
-    println!("[Agent Identity]");
-    println!("    - Running as Root:   {}", if is_root { "YES (UID 0)" } else { "NO" });
-    println!("    - Org ID:            {}", opts.org_id);
-    println!("    - Device ID:         {}", opts.device_id);
-    println!("    - Platform:          {}", Platform::current());
-    println!("    - Cache Directory:   {}", opts.cache_dir.display());
-    println!("    - Audit Trail File:  {}\n", opts.audit_log_path.display());
+    // 2. Root / Administrator Privilege Check
+    let is_elevated = is_running_as_root();
+    if !opts.json_output {
+        println!("[Agent Identity]");
+        println!("    - Elevated Privileges: {}", if is_elevated { "YES (Root / Administrator)" } else { "NO" });
+        println!("    - Org ID:             {}", opts.org_id);
+        println!("    - Device ID:          {}", opts.device_id);
+        println!("    - Platform:           {}", Platform::current());
+        println!("    - Cache Directory:    {}", opts.cache_dir.display());
+        println!("    - Audit Trail File:   {}\n", opts.audit_log_path.display());
+    }
 
-    if !is_root && !opts.allow_non_root {
+    if !is_elevated && !opts.allow_non_root && !opts.inventory {
         eprintln!("============================================================");
-        eprintln!("[ERROR] 'installer-agent' must be run with root privileges");
-        eprintln!("        to perform system installations into /Applications.");
+        eprintln!("[ERROR] 'installer-agent' requires elevated system privileges");
+        eprintln!("        (Root on macOS/Linux, Administrator on Windows)");
+        eprintln!("        to perform system package installations.");
         eprintln!();
-        eprintln!("Please execute using sudo:");
-        eprintln!("    sudo ./target/release/installer-agent");
+        #[cfg(unix)]
+        {
+            eprintln!("Please execute using sudo:");
+            eprintln!("    sudo ./target/release/installer-agent");
+        }
+        #[cfg(windows)]
+        {
+            eprintln!("Please run Command Prompt or PowerShell with:");
+            eprintln!("    'Run as administrator'");
+            eprintln!("    .\\target\\release\\installer-agent.exe");
+        }
         eprintln!("Or pass --allow-non-root for unprivileged testing.");
         eprintln!("============================================================");
         std::process::exit(1);
@@ -267,10 +311,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let control_plane: Arc<dyn ControlPlaneClient> = if let Some(ref url) = opts.control_plane_url {
-        println!("[Control Plane] Connecting to remote endpoint: {}", url);
+        if !opts.json_output {
+            println!("[Control Plane] Connecting to remote endpoint: {}", url);
+        }
         Arc::new(HttpControlPlaneClient::new(url))
     } else {
-        println!("[Control Plane] Using embedded Control Plane service");
+        if !opts.json_output {
+            println!("[Control Plane] Using embedded Control Plane service");
+        }
         mock_cp.clone().unwrap()
     };
 
@@ -286,17 +334,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native_installer = Box::new(PlatformInstaller::for_current_os());
     let engine = InstallerEngine::new(engine_config, control_plane.clone(), native_installer)?;
 
-    // 5. Handle Local Package Test Mode
+    // 5. Handle Inventory Inspection Mode
+    if opts.inventory || opts.sync_inventory {
+        let inv_report = engine.inventory_collector().collect(opts.org_id, &opts.device_id).await?;
+
+        if opts.sync_inventory {
+            control_plane.sync_inventory(&inv_report).await?;
+            if !opts.json_output {
+                println!("[Inventory] Synchronized {} applications with Control Plane.", inv_report.total_apps);
+            }
+        }
+
+        if opts.json_output {
+            println!("{}", serde_json::to_string_pretty(&inv_report)?);
+        } else {
+            display_inventory_table(&inv_report);
+        }
+
+        return Ok(());
+    }
+
+    // 6. Handle Local Package Test Mode
     if let Some(ref pkg_path) = opts.local_pkg {
         return run_local_package_workflow(&engine, mock_cp, &opts, pkg_path).await;
     }
 
-    // 6. Polling Execution Mode (One-shot or Daemon Loop)
+    // 7. Polling Execution Mode (One-shot or Daemon Loop)
     if opts.one_shot {
         println!("[Execution] Running in ONE-SHOT mode...");
         let processed = engine.poll_and_execute_once().await?;
         println!("[Execution] Processed {} task(s). Exiting.\n", processed);
         return Ok(());
+    }
+
+    // Daemon startup: initial inventory heartbeat
+    println!("[Daemon] Performing initial software inventory scan...");
+    if let Ok(inv) = engine.collect_and_sync_inventory().await {
+        println!("[Daemon] Discovered and synced {} installed applications.", inv.total_apps);
     }
 
     println!("[Daemon] Starting task polling loop (interval: {}s)...", opts.poll_interval_secs);
@@ -424,3 +498,47 @@ fn verify_installed_app_report(app_name: &str) {
         println!("    -> Notice: '{}' was not found in standard system application directories yet.", app_name);
     }
 }
+
+fn display_inventory_table(report: &installer_engine::AppInventoryReport) {
+    println!("=========================================================================================================================================");
+    println!("                                                Installed Application Inventory Report                                                   ");
+    println!("=========================================================================================================================================");
+    println!(
+        "Endpoint: {:<20} Platform: {:<10} Discovered Apps: {:<6} Scan Duration: {} ms",
+        report.device_id, report.platform, report.total_apps, report.scan_duration_ms
+    );
+    println!("-----------------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "{:<30} {:<15} {:<12} {:<16} {:<16} {}",
+        "APPLICATION NAME", "VERSION", "ARCH", "INSTALLED DATE", "TYPE", "PATH"
+    );
+    println!("-----------------------------------------------------------------------------------------------------------------------------------------");
+
+    for app in &report.apps {
+        let arch = app.architecture.as_deref().unwrap_or("n/a");
+        let path = app.install_path.as_deref().unwrap_or("n/a");
+        let installed_date = app
+            .installed_at
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+
+        let name_trunc = if app.name.len() > 28 {
+            format!("{}...", &app.name[..25])
+        } else {
+            app.name.clone()
+        };
+        let ver_trunc = if app.version.len() > 13 {
+            format!("{}...", &app.version[..10])
+        } else {
+            app.version.clone()
+        };
+
+        println!(
+            "{:<30} {:<15} {:<12} {:<16} {:<16} {}",
+            name_trunc, ver_trunc, arch, installed_date, app.package_type, path
+        );
+    }
+    println!("=========================================================================================================================================\n");
+}
+
+

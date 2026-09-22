@@ -16,6 +16,7 @@ thiserror = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 tempfile = "3.13"
+plist = "1.7"
 
 [[bin]]
 name = "installer-agent"

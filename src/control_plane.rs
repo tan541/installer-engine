@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{EngineError, Result};
+use crate::inventory::AppInventoryReport;
 use crate::models::{GroupPolicy, Platform, Task, TaskStatus, TaskType};
 
 pub trait ControlPlaneClient: Send + Sync {
@@ -32,18 +33,25 @@ pub trait ControlPlaneClient: Send + Sync {
         status: TaskStatus,
         error_message: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    fn sync_inventory<'a>(
+        &'a self,
+        report: &'a AppInventoryReport,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
 /// Thread-safe in-memory mock Control Plane for testing and agent simulation
 #[derive(Clone, Default)]
 pub struct MockControlPlane {
     tasks: Arc<RwLock<HashMap<String, Task>>>,
+    inventory_reports: Arc<RwLock<Vec<AppInventoryReport>>>,
 }
 
 impl MockControlPlane {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
+            inventory_reports: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -55,6 +63,11 @@ impl MockControlPlane {
     pub fn get_task(&self, task_id: &str) -> Option<Task> {
         let lock = self.tasks.read().unwrap();
         lock.get(task_id).cloned()
+    }
+
+    pub fn get_latest_inventory(&self) -> Option<AppInventoryReport> {
+        let lock = self.inventory_reports.read().unwrap();
+        lock.last().cloned()
     }
 }
 
@@ -184,6 +197,26 @@ impl ControlPlaneClient for MockControlPlane {
             }
         })
     }
+
+    fn sync_inventory<'a>(
+        &'a self,
+        report: &'a AppInventoryReport,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut lock = self
+                .inventory_reports
+                .write()
+                .map_err(|_| EngineError::ControlPlane("Lock poisoned".to_string()))?;
+            lock.push(report.clone());
+            tracing::info!(
+                org_id = report.org_id,
+                device_id = %report.device_id,
+                app_count = report.total_apps,
+                "Synchronized application inventory to Mock Control Plane"
+            );
+            Ok(())
+        })
+    }
 }
 
 /// HTTP REST client for communicating with a live Control Plane server
@@ -282,6 +315,31 @@ impl ControlPlaneClient for HttpControlPlaneClient {
             if !response.status().is_success() {
                 return Err(EngineError::ControlPlane(format!(
                     "Failed to update task status: HTTP {}",
+                    response.status()
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
+    fn sync_inventory<'a>(
+        &'a self,
+        report: &'a AppInventoryReport,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/api/v1/inventory/sync", self.base_url);
+            let response = self
+                .client
+                .post(&url)
+                .json(report)
+                .send()
+                .await
+                .map_err(EngineError::Reqwest)?;
+
+            if !response.status().is_success() {
+                return Err(EngineError::ControlPlane(format!(
+                    "Failed to sync inventory: HTTP {}",
                     response.status()
                 )));
             }

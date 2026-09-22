@@ -7,7 +7,8 @@ use crate::control_plane::ControlPlaneClient;
 use crate::download::Downloader;
 use crate::error::Result;
 use crate::installer::Installer;
-use crate::models::{InstallReport, Platform, Task, TaskStatus};
+use crate::inventory::{create_inventory_collector, AppInventoryReport, InventoryCollector};
+use crate::models::{InstallReport, Platform, Task, TaskStatus, TaskType};
 use crate::verifier::ChecksumVerifier;
 
 pub struct EngineConfig {
@@ -23,6 +24,7 @@ pub struct InstallerEngine {
     control_plane: Arc<dyn ControlPlaneClient>,
     downloader: Downloader,
     installer: Box<dyn Installer>,
+    inventory_collector: Box<dyn InventoryCollector>,
     audit_logger: AuditLogger,
 }
 
@@ -34,12 +36,33 @@ impl InstallerEngine {
     ) -> Result<Self> {
         let downloader = Downloader::new(&config.cache_dir)?;
         let audit_logger = AuditLogger::new(&config.audit_log_path)?;
+        let inventory_collector = create_inventory_collector(config.platform);
 
         Ok(Self {
             config,
             control_plane,
             downloader,
             installer,
+            inventory_collector,
+            audit_logger,
+        })
+    }
+
+    pub fn with_all(
+        config: EngineConfig,
+        control_plane: Arc<dyn ControlPlaneClient>,
+        installer: Box<dyn Installer>,
+        inventory_collector: Box<dyn InventoryCollector>,
+    ) -> Result<Self> {
+        let downloader = Downloader::new(&config.cache_dir)?;
+        let audit_logger = AuditLogger::new(&config.audit_log_path)?;
+
+        Ok(Self {
+            config,
+            control_plane,
+            downloader,
+            installer,
+            inventory_collector,
             audit_logger,
         })
     }
@@ -167,6 +190,21 @@ impl InstallerEngine {
 
     /// Internal execution pipeline helper
     async fn execute_install_pipeline(&self, task: &Task) -> Result<InstallReport> {
+        // Handle inventory collection tasks directly
+        if task.task_type == TaskType::CollectInventory {
+            let report = self.collect_and_sync_inventory().await?;
+            return Ok(InstallReport {
+                success: true,
+                exit_code: Some(0),
+                message: format!(
+                    "Successfully collected and synchronized {} installed applications",
+                    report.total_apps
+                ),
+                installed_path: None,
+                duration_ms: report.scan_duration_ms,
+            });
+        }
+
         // Derive local filename from download url
         let file_name = Path::new(&task.download_url)
             .file_name()
@@ -200,6 +238,33 @@ impl InstallerEngine {
         Ok(report)
     }
 
+    /// Scans installed software on the current device and sends inventory to Control Plane
+    pub async fn collect_and_sync_inventory(&self) -> Result<AppInventoryReport> {
+        let report = self
+            .inventory_collector
+            .collect(self.config.org_id, &self.config.device_id)
+            .await?;
+
+        self.control_plane.sync_inventory(&report).await?;
+
+        let _ = self.audit_logger.record_event(
+            "inventory.sync",
+            "inventory-job",
+            self.config.org_id,
+            &self.config.device_id,
+            "System Inventory",
+            None,
+            "synced",
+            Some(format!(
+                "Scanned and synchronized {} installed applications",
+                report.total_apps
+            )),
+            Some(report.scan_duration_ms),
+        );
+
+        Ok(report)
+    }
+
     /// Polls control plane once and processes all pending tasks
     pub async fn poll_and_execute_once(&self) -> Result<usize> {
         let tasks = self.fetch_pending_tasks().await?;
@@ -214,6 +279,10 @@ impl InstallerEngine {
 
     pub fn audit_logger(&self) -> &AuditLogger {
         &self.audit_logger
+    }
+
+    pub fn inventory_collector(&self) -> &dyn InventoryCollector {
+        self.inventory_collector.as_ref()
     }
 }
 
@@ -337,4 +406,73 @@ mod tests {
         assert_eq!(cp_task.task_status, TaskStatus::Failed);
         assert!(cp_task.error_message.unwrap().contains("Checksum mismatch"));
     }
+
+    #[tokio::test]
+    async fn test_end_to_end_engine_inventory_task() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let audit_log = dir.path().join("audit.log");
+
+        let cp = Arc::new(MockControlPlane::new());
+        let task = Task {
+            task_id: "inventory-task-1".to_string(),
+            org_id: 10,
+            device_id: "device-mac-01".to_string(),
+            target_platform: Platform::MacOS,
+            task_type: TaskType::CollectInventory,
+            task_desc: "scan_installed_apps".to_string(),
+            app_name: "Inventory Scanner".to_string(),
+            app_version: None,
+            download_url: "none".to_string(),
+            expected_checksum: "none".to_string(),
+            installer_args: vec![],
+            task_status: TaskStatus::New,
+            error_message: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        cp.insert_task(task.clone());
+
+        let config = EngineConfig {
+            org_id: 10,
+            device_id: "device-mac-01".to_string(),
+            platform: Platform::MacOS,
+            cache_dir,
+            audit_log_path: audit_log.clone(),
+        };
+
+        let sample_app = crate::inventory::InstalledApp {
+            app_id: "com.test.App".to_string(),
+            name: "Test App".to_string(),
+            version: "1.0.0".to_string(),
+            build_version: None,
+            publisher: Some("Test Dev".to_string()),
+            install_path: Some("/Applications/Test App.app".to_string()),
+            installed_at: None,
+            architecture: Some("arm64".to_string()),
+            package_type: crate::inventory::AppPackageType::AppBundle,
+            uninstall_command: None,
+            is_system_app: false,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mock_collector = Box::new(crate::inventory::MockInventoryCollector::new(vec![sample_app]));
+        let mock_installer = Box::new(MockInstaller::successful());
+        let engine = InstallerEngine::with_all(config, cp.clone(), mock_installer, mock_collector).unwrap();
+
+        let report = engine.process_task(&task).await.unwrap();
+        assert!(report.success);
+        assert!(report.message.contains("1 installed applications"));
+
+        // Verify inventory synchronized to control plane
+        let latest_inv = cp.get_latest_inventory().unwrap();
+        assert_eq!(latest_inv.total_apps, 1);
+        assert_eq!(latest_inv.apps[0].name, "Test App");
+
+        // Verify audit log
+        let audit_content = std::fs::read_to_string(audit_log).unwrap();
+        assert!(audit_content.contains("inventory.sync"));
+    }
 }
+

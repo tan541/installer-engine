@@ -81,6 +81,8 @@ pub enum TaskType {
     UninstallApp,
     #[serde(rename = "distribute.app")]
     DistributeApp,
+    #[serde(rename = "collect.inventory")]
+    CollectInventory,
     #[serde(untagged)]
     Custom(String),
 }
