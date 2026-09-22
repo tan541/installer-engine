@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::audit::AuditLogger;
+use crate::blocker::{AppBlockMonitor, BlockAction, BlockCandidate};
 use crate::control_plane::ControlPlaneClient;
 use crate::download::Downloader;
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::installer::Installer;
 use crate::inventory::{create_inventory_collector, AppInventoryReport, InventoryCollector};
 use crate::models::{InstallReport, Platform, Task, TaskStatus, TaskType};
@@ -26,6 +27,7 @@ pub struct InstallerEngine {
     installer: Box<dyn Installer>,
     inventory_collector: Box<dyn InventoryCollector>,
     audit_logger: AuditLogger,
+    block_monitor: Option<Arc<AppBlockMonitor>>,
 }
 
 impl InstallerEngine {
@@ -45,6 +47,7 @@ impl InstallerEngine {
             installer,
             inventory_collector,
             audit_logger,
+            block_monitor: None,
         })
     }
 
@@ -64,7 +67,21 @@ impl InstallerEngine {
             installer,
             inventory_collector,
             audit_logger,
+            block_monitor: None,
         })
+    }
+
+    pub fn with_block_monitor(mut self, monitor: Arc<AppBlockMonitor>) -> Self {
+        self.block_monitor = Some(monitor);
+        self
+    }
+
+    pub fn set_block_monitor(&mut self, monitor: Arc<AppBlockMonitor>) {
+        self.block_monitor = Some(monitor);
+    }
+
+    pub fn block_monitor(&self) -> Option<&Arc<AppBlockMonitor>> {
+        self.block_monitor.as_ref()
     }
 
     /// Fetches pending `New` tasks for this device from the Control Plane.
@@ -81,11 +98,12 @@ impl InstallerEngine {
 
     /// Processes a single task through the full lifecycle:
     /// 1. Mark status -> Processing
-    /// 2. Download package to local cache
-    /// 3. Verify Checksum (SHA-256)
-    /// 4. Execute installation
-    /// 5. Record Audit Trail
-    /// 6. Mark status -> Done (or Failed on error)
+    /// 2. Pre-installation Security Policy / Blocker check
+    /// 3. Download package to local cache
+    /// 4. Verify Checksum (SHA-256)
+    /// 5. Execute installation
+    /// 6. Record Audit Trail
+    /// 7. Mark status -> Done (or Failed on error)
     pub async fn process_task(&self, task: &Task) -> Result<InstallReport> {
         let start_time = Instant::now();
         tracing::info!(
@@ -205,6 +223,26 @@ impl InstallerEngine {
             });
         }
 
+        // Step 0: Pre-installation security check against active AppBlock policies
+        if let Some(ref monitor) = self.block_monitor {
+            let candidate = BlockCandidate {
+                app_name: Some(task.app_name.clone()),
+                executable_name: Some(task.app_name.clone()),
+                sha256_hash: Some(task.expected_checksum.clone()),
+                is_installer: true,
+                ..Default::default()
+            };
+
+            if let Some(violation) = monitor.evaluate_and_remediate(&candidate).await? {
+                if violation.action_taken != BlockAction::AuditOnly {
+                    return Err(EngineError::Installation(format!(
+                        "Installation blocked by security policy '{}' (Rule ID: {})",
+                        violation.rule_description, violation.rule_id
+                    )));
+                }
+            }
+        }
+
         // Derive local filename from download url
         let file_name = Path::new(&task.download_url)
             .file_name()
@@ -289,6 +327,10 @@ impl InstallerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocker::{
+        AppBlockMonitorConfig, AppBlockPolicy, BlockRule, BlockRuleType, MockDesktopNotifier,
+        MockRemediator, PolicyEnforcementMode,
+    };
     use crate::control_plane::MockControlPlane;
     use crate::installer::MockInstaller;
     use crate::models::{Platform, TaskType};
@@ -354,6 +396,103 @@ mod tests {
         assert!(audit_content.contains("task.pickup"));
         assert!(audit_content.contains("task.verify_checksum"));
         assert!(audit_content.contains("task.complete"));
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_engine_blocked_by_security_policy() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let audit_log = dir.path().join("audit.log");
+        let quarantine_dir = dir.path().join("quarantine");
+
+        let mut pkg_file = NamedTempFile::new().unwrap();
+        let payload = b"unauthorized torrent client installer";
+        pkg_file.write_all(payload).unwrap();
+        pkg_file.flush().unwrap();
+        let sha256 = ChecksumVerifier::compute_bytes_sha256(payload);
+
+        let cp = Arc::new(MockControlPlane::new());
+        let task = Task {
+            task_id: "test-task-blocked".to_string(),
+            org_id: 1,
+            device_id: "mac-01".to_string(),
+            target_platform: Platform::MacOS,
+            task_type: TaskType::InstallApp,
+            task_desc: "install_torrent".to_string(),
+            app_name: "uTorrent Pro".to_string(),
+            app_version: Some("2.0.0".to_string()),
+            download_url: format!("file://{}", pkg_file.path().display()),
+            expected_checksum: sha256,
+            installer_args: vec![],
+            task_status: TaskStatus::New,
+            error_message: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        cp.insert_task(task.clone());
+
+        // Setup block policy
+        let block_policy = AppBlockPolicy {
+            policy_id: 99,
+            org_id: 1,
+            name: "Corporate P2P Restrictions".to_string(),
+            mode: PolicyEnforcementMode::Blocklist,
+            rules: vec![
+                BlockRule::new("rule-p2p", "Block Torrent Apps", BlockRuleType::PatternName("*torrent*".to_string())),
+            ],
+            custom_notification_message: None,
+            updated_at: Utc::now(),
+        };
+        cp.add_block_policy(block_policy.clone());
+
+        let monitor_config = AppBlockMonitorConfig {
+            org_id: 1,
+            device_id: "mac-01".to_string(),
+            quarantine_dir,
+        };
+
+        let evaluator = Arc::new(std::sync::RwLock::new(crate::blocker::BlockEvaluator::new()));
+        let remediator = Box::new(MockRemediator::new());
+        let notifier = Box::new(MockDesktopNotifier::new());
+        let audit_logger = AuditLogger::new(&audit_log).unwrap();
+
+        let monitor = Arc::new(AppBlockMonitor::with_components(
+            monitor_config,
+            cp.clone(),
+            evaluator,
+            remediator,
+            notifier,
+            audit_logger,
+        ));
+        monitor.add_policy(block_policy);
+
+        let config = EngineConfig {
+            org_id: 1,
+            device_id: "mac-01".to_string(),
+            platform: Platform::MacOS,
+            cache_dir,
+            audit_log_path: audit_log.clone(),
+        };
+
+        let installer = Box::new(MockInstaller::successful());
+        let engine = InstallerEngine::new(config, cp.clone(), installer)
+            .unwrap()
+            .with_block_monitor(monitor);
+
+        let result = engine.process_task(&task).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Installation blocked by security policy"));
+
+        // Verify task updated to Failed in Control Plane
+        let cp_task = cp.get_task("test-task-blocked").unwrap();
+        assert_eq!(cp_task.task_status, TaskStatus::Failed);
+
+        // Verify violation reported to Control Plane
+        let violations = cp.get_block_violations();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].app_name, "uTorrent Pro");
     }
 
     #[tokio::test]
@@ -475,4 +614,3 @@ mod tests {
         assert!(audit_content.contains("inventory.sync"));
     }
 }
-

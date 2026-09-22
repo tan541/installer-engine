@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::blocker::models::{AppBlockPolicy, BlockViolationEvent};
 use crate::error::{EngineError, Result};
 use crate::inventory::AppInventoryReport;
 use crate::models::{GroupPolicy, Platform, Task, TaskStatus, TaskType};
@@ -38,6 +39,17 @@ pub trait ControlPlaneClient: Send + Sync {
         &'a self,
         report: &'a AppInventoryReport,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    fn fetch_block_policies<'a>(
+        &'a self,
+        org_id: u64,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AppBlockPolicy>>> + Send + 'a>>;
+
+    fn report_block_violation<'a>(
+        &'a self,
+        event: &'a BlockViolationEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
 /// Thread-safe in-memory mock Control Plane for testing and agent simulation
@@ -45,6 +57,8 @@ pub trait ControlPlaneClient: Send + Sync {
 pub struct MockControlPlane {
     tasks: Arc<RwLock<HashMap<String, Task>>>,
     inventory_reports: Arc<RwLock<Vec<AppInventoryReport>>>,
+    block_policies: Arc<RwLock<Vec<AppBlockPolicy>>>,
+    block_violations: Arc<RwLock<Vec<BlockViolationEvent>>>,
 }
 
 impl MockControlPlane {
@@ -52,6 +66,8 @@ impl MockControlPlane {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             inventory_reports: Arc::new(RwLock::new(Vec::new())),
+            block_policies: Arc::new(RwLock::new(Vec::new())),
+            block_violations: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -68,6 +84,16 @@ impl MockControlPlane {
     pub fn get_latest_inventory(&self) -> Option<AppInventoryReport> {
         let lock = self.inventory_reports.read().unwrap();
         lock.last().cloned()
+    }
+
+    pub fn add_block_policy(&self, policy: AppBlockPolicy) {
+        let mut lock = self.block_policies.write().unwrap();
+        lock.push(policy);
+    }
+
+    pub fn get_block_violations(&self) -> Vec<BlockViolationEvent> {
+        let lock = self.block_violations.read().unwrap();
+        lock.clone()
     }
 }
 
@@ -217,6 +243,47 @@ impl ControlPlaneClient for MockControlPlane {
             Ok(())
         })
     }
+
+    fn fetch_block_policies<'a>(
+        &'a self,
+        org_id: u64,
+        _device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AppBlockPolicy>>> + Send + 'a>> {
+        Box::pin(async move {
+            let lock = self
+                .block_policies
+                .read()
+                .map_err(|_| EngineError::ControlPlane("Lock poisoned".to_string()))?;
+
+            let matching: Vec<AppBlockPolicy> = lock
+                .iter()
+                .filter(|p| p.org_id == org_id || p.org_id == 0)
+                .cloned()
+                .collect();
+
+            Ok(matching)
+        })
+    }
+
+    fn report_block_violation<'a>(
+        &'a self,
+        event: &'a BlockViolationEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut lock = self
+                .block_violations
+                .write()
+                .map_err(|_| EngineError::ControlPlane("Lock poisoned".to_string()))?;
+            lock.push(event.clone());
+            tracing::warn!(
+                app = %event.app_name,
+                rule = %event.rule_id,
+                action = %event.action_taken.as_str(),
+                "Reported application installation block violation to Control Plane"
+            );
+            Ok(())
+        })
+    }
 }
 
 /// HTTP REST client for communicating with a live Control Plane server
@@ -235,6 +302,11 @@ struct StatusUpdateRequest<'a> {
 #[derive(Deserialize)]
 struct FetchTasksResponse {
     tasks: Vec<Task>,
+}
+
+#[derive(Deserialize)]
+struct FetchBlockPoliciesResponse {
+    policies: Vec<AppBlockPolicy>,
 }
 
 impl HttpControlPlaneClient {
@@ -340,6 +412,44 @@ impl ControlPlaneClient for HttpControlPlaneClient {
             if !response.status().is_success() {
                 return Err(EngineError::ControlPlane(format!(
                     "Failed to sync inventory: HTTP {}",
+                    response.status()
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
+    fn fetch_block_policies<'a>(
+        &'a self,
+        org_id: u64,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AppBlockPolicy>>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/api/v1/policies/block?org_id={}&device_id={}", self.base_url, org_id, device_id);
+            let response = self.client.get(&url).send().await.map_err(EngineError::Reqwest)?;
+            let parsed = response.json::<FetchBlockPoliciesResponse>().await.map_err(EngineError::Reqwest)?;
+            Ok(parsed.policies)
+        })
+    }
+
+    fn report_block_violation<'a>(
+        &'a self,
+        event: &'a BlockViolationEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/api/v1/telemetry/violations", self.base_url);
+            let response = self
+                .client
+                .post(&url)
+                .json(event)
+                .send()
+                .await
+                .map_err(EngineError::Reqwest)?;
+
+            if !response.status().is_success() {
+                return Err(EngineError::ControlPlane(format!(
+                    "Failed to report block violation: HTTP {}",
                     response.status()
                 )));
             }

@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use installer_engine::{
-    init_logger, AppInstallationVerifier, ChecksumVerifier, ControlPlaneClient, EngineConfig,
-    HttpControlPlaneClient, InstallerEngine, MockControlPlane, Platform, PlatformInstaller, Task,
-    TaskStatus, TaskType,
+    init_logger, AppBlockMonitor, AppBlockMonitorConfig, AppBlockPolicy, AppInstallationVerifier,
+    BlockAction, BlockCandidate, BlockEvaluator, BlockRule, BlockRuleType, ChecksumVerifier,
+    ControlPlaneClient, EngineConfig, EvaluationResult, HttpControlPlaneClient, InstallerEngine,
+    MockControlPlane, Platform, PlatformInstaller, PolicyEnforcementMode, Task, TaskStatus,
+    TaskType,
 };
 
 #[cfg(unix)]
@@ -40,6 +42,7 @@ struct AgentCliOptions {
     device_id: String,
     control_plane_url: Option<String>,
     cache_dir: PathBuf,
+    quarantine_dir: PathBuf,
     audit_log_path: PathBuf,
     poll_interval_secs: u64,
     one_shot: bool,
@@ -48,6 +51,8 @@ struct AgentCliOptions {
     inventory: bool,
     json_output: bool,
     sync_inventory: bool,
+    enable_blocking: bool,
+    test_block: Option<String>,
 }
 
 impl AgentCliOptions {
@@ -66,6 +71,8 @@ impl AgentCliOptions {
         let mut inventory = false;
         let mut json_output = false;
         let mut sync_inventory = false;
+        let mut enable_blocking = true; // Enabled by default for enterprise security
+        let mut test_block = None;
 
         let is_root = is_running_as_root();
         let default_cache_dir = if is_root {
@@ -89,6 +96,27 @@ impl AgentCliOptions {
             std::env::temp_dir().join("installer-engine-cache")
         };
 
+        let default_quarantine_dir = if is_root {
+            #[cfg(target_os = "macos")]
+            {
+                PathBuf::from("/Library/Caches/installer-engine/quarantine")
+            }
+            #[cfg(target_os = "linux")]
+            {
+                PathBuf::from("/var/cache/installer-engine/quarantine")
+            }
+            #[cfg(target_os = "windows")]
+            {
+                PathBuf::from(r"C:\ProgramData\installer-engine\quarantine")
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            {
+                std::env::temp_dir().join("installer-engine-quarantine")
+            }
+        } else {
+            std::env::temp_dir().join("installer-engine-quarantine")
+        };
+
         let default_audit_log = if is_root {
             #[cfg(unix)]
             {
@@ -103,6 +131,7 @@ impl AgentCliOptions {
         };
 
         let mut cache_dir = default_cache_dir;
+        let mut quarantine_dir = default_quarantine_dir;
         let mut audit_log_path = default_audit_log;
 
         let mut i = 1;
@@ -140,6 +169,13 @@ impl AgentCliOptions {
                     }
                     cache_dir = PathBuf::from(&args[i]);
                 }
+                "--quarantine-dir" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--quarantine-dir requires a path argument".to_string());
+                    }
+                    quarantine_dir = PathBuf::from(&args[i]);
+                }
                 "--audit-log" => {
                     i += 1;
                     if i >= args.len() {
@@ -171,6 +207,19 @@ impl AgentCliOptions {
                 "--sync-inventory" => {
                     sync_inventory = true;
                 }
+                "--enable-blocking" => {
+                    enable_blocking = true;
+                }
+                "--disable-blocking" => {
+                    enable_blocking = false;
+                }
+                "--test-block" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--test-block requires an application name or path argument".to_string());
+                    }
+                    test_block = Some(args[i].clone());
+                }
                 "--pkg" | "--local-pkg" => {
                     i += 1;
                     if i >= args.len() {
@@ -190,6 +239,7 @@ impl AgentCliOptions {
             device_id,
             control_plane_url,
             cache_dir,
+            quarantine_dir,
             audit_log_path,
             poll_interval_secs,
             one_shot,
@@ -198,6 +248,8 @@ impl AgentCliOptions {
             inventory,
             json_output,
             sync_inventory,
+            enable_blocking,
+            test_block,
         })
     }
 }
@@ -228,18 +280,23 @@ USAGE:
 
 DESCRIPTION:
     Runs the endpoint installer agent daemon or one-shot task executor as root.
-    Polls the control plane for application distribution tasks, downloads and
-    verifies packages (SHA-256), and executes native silent installations.
+    Polls the control plane for application distribution tasks, enforces real-time
+    installation blocking policies, downloads and verifies packages (SHA-256),
+    and executes native silent installations.
 
 OPTIONS:
     -i, --inventory             Scan and list all installed applications and metadata on this device
     --json                      Output inventory scan results as JSON
     --sync-inventory            Scan and synchronize installed applications directly with Control Plane
     --pkg <PATH>                Run immediate local package installation workflow (e.g. data/ShieldNet 360-1.6.0-arm64.pkg)
+    --enable-blocking           Enable real-time application installation blocking and control (default: true)
+    --disable-blocking          Disable application installation blocking
+    --test-block <TARGET>       Evaluate candidate application name or path against security block policies
     --org-id <NUM>              Organization ID (default: 1)
     --device-id <ID>            Device identifier (default: endpoint-<hostname>)
     --control-plane-url <URL>   Remote Control Plane HTTP base URL (if omitted, uses built-in mock Control Plane)
     --cache-dir <PATH>          Staging cache directory (default: /Library/Caches/installer-engine on macOS)
+    --quarantine-dir <PATH>     Quarantine directory for blocked artifacts
     --audit-log <PATH>          Audit trail output file (default: /var/log/installer-engine-audit.log)
     --poll-interval <SECS>      Polling interval in seconds for daemon mode (default: 10)
     --one-shot                  Poll control plane once, execute pending tasks, and exit
@@ -277,15 +334,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    - Org ID:             {}", opts.org_id);
         println!("    - Device ID:          {}", opts.device_id);
         println!("    - Platform:           {}", Platform::current());
+        println!("    - App Blocker Active: {}", if opts.enable_blocking { "YES" } else { "NO" });
         println!("    - Cache Directory:    {}", opts.cache_dir.display());
+        println!("    - Quarantine Dir:     {}", opts.quarantine_dir.display());
         println!("    - Audit Trail File:   {}\n", opts.audit_log_path.display());
     }
 
-    if !is_elevated && !opts.allow_non_root && !opts.inventory {
+    if !is_elevated && !opts.allow_non_root && !opts.inventory && opts.test_block.is_none() {
         eprintln!("============================================================");
         eprintln!("[ERROR] 'installer-agent' requires elevated system privileges");
         eprintln!("        (Root on macOS/Linux, Administrator on Windows)");
-        eprintln!("        to perform system package installations.");
+        eprintln!("        to perform system package installations and process control.");
         eprintln!();
         #[cfg(unix)]
         {
@@ -305,7 +364,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Initialize Control Plane Client
     let mock_cp = if opts.control_plane_url.is_none() {
-        Some(Arc::new(MockControlPlane::new()))
+        let cp = Arc::new(MockControlPlane::new());
+        // Seed default corporate block policy in mock control plane
+        cp.add_block_policy(AppBlockPolicy {
+            policy_id: 1,
+            org_id: opts.org_id,
+            name: "Enterprise Security Blocklist".to_string(),
+            mode: PolicyEnforcementMode::Blocklist,
+            rules: vec![
+                BlockRule::new("rule-torrent", "Block P2P & Torrent clients", BlockRuleType::PatternName("*torrent*".to_string()))
+                    .with_action(BlockAction::TerminateAndQuarantine),
+                BlockRule::new("rule-steam", "Block Steam Gaming", BlockRuleType::PatternName("*steam*".to_string()))
+                    .with_action(BlockAction::TerminateAndQuarantine),
+                BlockRule::new("rule-unapproved-remote", "Block unapproved VNC/AnyDesk", BlockRuleType::PatternName("*anydesk*".to_string()))
+                    .with_action(BlockAction::TerminateAndQuarantine),
+            ],
+            custom_notification_message: Some("This software has been blocked in accordance with organizational security policy.".to_string()),
+            updated_at: chrono::Utc::now(),
+        });
+        Some(cp)
     } else {
         None
     };
@@ -322,7 +399,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mock_cp.clone().unwrap()
     };
 
-    // 4. Initialize Engine Config & Native Platform Installer
+    // 4. Initialize Block Monitor
+    let block_monitor = if opts.enable_blocking {
+        let monitor_config = AppBlockMonitorConfig {
+            org_id: opts.org_id,
+            device_id: opts.device_id.clone(),
+            quarantine_dir: opts.quarantine_dir.clone(),
+        };
+        let mon = Arc::new(AppBlockMonitor::new(
+            monitor_config,
+            control_plane.clone(),
+            &opts.audit_log_path,
+        )?);
+        let _ = mon.sync_policies().await;
+        Some(mon)
+    } else {
+        None
+    };
+
+    // 5. Handle Test Block Evaluation Mode
+    if let Some(ref test_target) = opts.test_block {
+        let evaluator = block_monitor
+            .as_ref()
+            .map(|m| m.evaluator())
+            .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(BlockEvaluator::new())));
+
+        println!("[Policy Check] Evaluating target: '{}'...", test_target);
+        let candidate = BlockCandidate {
+            app_name: Some(test_target.clone()),
+            executable_name: Some(test_target.clone()),
+            is_installer: true,
+            ..Default::default()
+        };
+
+        let result = evaluator.read().unwrap().evaluate(&candidate);
+        match result {
+            EvaluationResult::Allowed => {
+                println!("    -> [ALLOWED] Application is approved under active security policies.");
+            }
+            EvaluationResult::Blocked {
+                policy_id,
+                rule_id,
+                rule_description,
+                action,
+                match_reason,
+            } => {
+                println!("    -> [BLOCKED] Application matches security block rule!");
+                println!("       Policy ID:        {}", policy_id);
+                println!("       Rule ID:          {}", rule_id);
+                println!("       Rule Description: {}", rule_description);
+                println!("       Enforced Action:  {:?}", action);
+                println!("       Match Reason:     {}", match_reason);
+            }
+        }
+        return Ok(());
+    }
+
+    // 6. Initialize Engine Config & Native Platform Installer
     let engine_config = EngineConfig {
         org_id: opts.org_id,
         device_id: opts.device_id.clone(),
@@ -332,9 +465,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let native_installer = Box::new(PlatformInstaller::for_current_os());
-    let engine = InstallerEngine::new(engine_config, control_plane.clone(), native_installer)?;
+    let mut engine = InstallerEngine::new(engine_config, control_plane.clone(), native_installer)?;
+    if let Some(ref mon) = block_monitor {
+        engine.set_block_monitor(mon.clone());
+    }
 
-    // 5. Handle Inventory Inspection Mode
+    // 7. Handle Inventory Inspection Mode
     if opts.inventory || opts.sync_inventory {
         let inv_report = engine.inventory_collector().collect(opts.org_id, &opts.device_id).await?;
 
@@ -354,14 +490,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 6. Handle Local Package Test Mode
+    // 8. Handle Local Package Test Mode
     if let Some(ref pkg_path) = opts.local_pkg {
         return run_local_package_workflow(&engine, mock_cp, &opts, pkg_path).await;
     }
 
-    // 7. Polling Execution Mode (One-shot or Daemon Loop)
+    // 9. Polling Execution Mode (One-shot or Daemon Loop)
     if opts.one_shot {
         println!("[Execution] Running in ONE-SHOT mode...");
+        if let Some(ref mon) = block_monitor {
+            let violations = mon.scan_and_remediate_cycle().await?;
+            if !violations.is_empty() {
+                println!("[Blocker] Remediated {} security violation(s).", violations.len());
+            }
+        }
         let processed = engine.poll_and_execute_once().await?;
         println!("[Execution] Processed {} task(s). Exiting.\n", processed);
         return Ok(());
@@ -373,7 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[Daemon] Discovered and synced {} installed applications.", inv.total_apps);
     }
 
-    println!("[Daemon] Starting task polling loop (interval: {}s)...", opts.poll_interval_secs);
+    println!("[Daemon] Starting task polling & real-time blocking loop (interval: {}s)...", opts.poll_interval_secs);
     println!("[Daemon] Press Ctrl+C to stop.\n");
 
     let poll_interval = Duration::from_secs(opts.poll_interval_secs);
@@ -385,6 +527,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             _ = tokio::time::sleep(poll_interval) => {
+                // 1. Run real-time application control & interception cycle
+                if let Some(ref mon) = block_monitor {
+                    if let Ok(violations) = mon.scan_and_remediate_cycle().await {
+                        for v in violations {
+                            println!("  -> [BLOCK EVENT] Intercepted unapproved app '{}' (Rule: {})", v.app_name, v.rule_id);
+                        }
+                    }
+                }
+
+                // 2. Poll and execute pending tasks from Control Plane
                 match engine.fetch_pending_tasks().await {
                     Ok(tasks) => {
                         if !tasks.is_empty() {
@@ -540,5 +692,3 @@ fn display_inventory_table(report: &installer_engine::AppInventoryReport) {
     }
     println!("=========================================================================================================================================\n");
 }
-
-

@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod blocker;
 pub mod control_plane;
 pub mod download;
 pub mod engine;
@@ -11,6 +12,12 @@ pub mod verifier;
 
 // Re-exports for convenience
 pub use audit::{AuditLogger, AuditRecord};
+pub use blocker::{
+    wildcard_match, AppBlockMonitor, AppBlockMonitorConfig, AppBlockPolicy, BlockAction,
+    BlockCandidate, BlockEvaluator, BlockRule, BlockRuleType, BlockViolationEvent, DesktopNotifier,
+    EvaluationResult, MockDesktopNotifier, MockRemediator, PlatformDesktopNotifier,
+    PlatformRemediator, PolicyEnforcementMode,
+};
 pub use control_plane::{ControlPlaneClient, HttpControlPlaneClient, MockControlPlane};
 pub use download::Downloader;
 pub use engine::{EngineConfig, InstallerEngine};
@@ -24,4 +31,3 @@ pub use inventory::{
 pub use logging::init_logger;
 pub use models::{GroupPolicy, InstallReport, Platform, Task, TaskStatus, TaskType};
 pub use verifier::{AppInstallationVerifier, ChecksumVerifier};
-

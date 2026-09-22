@@ -33,6 +33,12 @@ pub enum EngineError {
         message: String,
     },
 
+    #[error("Installation error: {0}")]
+    Installation(String),
+
+    #[error("Security policy violation: {0}")]
+    SecurityPolicyBlocked(String),
+
     #[error("Control plane error: {0}")]
     ControlPlane(String),
 
