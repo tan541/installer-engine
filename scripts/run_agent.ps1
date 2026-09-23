@@ -11,7 +11,7 @@
     Operation to perform: Inventory, InventoryJson, SyncInventory, TestBlock, Install, Daemon, OneShot, Build
 
 .PARAMETER Target
-    Application name (for TestBlock) or local installer file path (for Install)
+    Application name (for TestBlock) or local installer file path (for Install) - supports paths with spaces.
 
 .PARAMETER OrgId
     Organization ID (default: 1)
@@ -32,7 +32,7 @@
     .\scripts\run_agent.ps1 -Action Inventory
     .\scripts\run_agent.ps1 -Action TestBlock -Target "uTorrent"
     .\scripts\run_agent.ps1 -Action TestBlock -Target "Microsoft Teams"
-    .\scripts\run_agent.ps1 -Action Install -Target "C:\packages\setup.msi"
+    .\scripts\run_agent.ps1 -Action Install -Target "C:\Users\robert1\Documents\Firefox Installer.exe"
     .\scripts\run_agent.ps1 -Action Daemon
 #>
 
@@ -42,8 +42,8 @@ param(
     [ValidateSet("Inventory", "InventoryJson", "SyncInventory", "TestBlock", "Install", "Daemon", "OneShot", "Build", "Help")]
     [string]$Action = "Help",
 
-    [Parameter(Position = 1, Mandatory = $false)]
-    [string]$Target = "",
+    [Parameter(Position = 1, Mandatory = $false, ValueFromRemainingArguments = $true)]
+    [string[]]$Target = @(),
 
     [Parameter(Mandatory = $false)]
     [uint64]$OrgId = 1,
@@ -62,6 +62,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Flatten Target parameter if multiple tokens or quotes were split across arguments
+$TargetStr = if ($Target -is [array]) { ($Target -join " ").Trim('"').Trim('\'') } else { [string]$Target }
 
 # Paths
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -143,7 +146,7 @@ Examples:
   .\scripts\run_agent.ps1 -Action Inventory
   .\scripts\run_agent.ps1 -Action TestBlock -Target "uTorrent"
   .\scripts\run_agent.ps1 -Action TestBlock -Target "Microsoft Teams"
-  .\scripts\run_agent.ps1 -Action Install -Target ".\setup.msi"
+  .\scripts\run_agent.ps1 -Action Install -Target "C:\Users\robert1\Documents\Firefox Installer.exe"
   .\scripts\run_agent.ps1 -Action Daemon
 =============================================================================
 "@
@@ -207,22 +210,22 @@ switch ($Action) {
         $AgentArgs += "--sync-inventory"
     }
     "TestBlock" {
-        if ([string]::IsNullOrWhiteSpace($Target)) {
+        if ([string]::IsNullOrWhiteSpace($TargetStr)) {
             Write-Err "Missing -Target parameter for TestBlock action (e.g. -Target 'uTorrent')."
             exit 1
         }
         $RequiresElevation = $false
         $AgentArgs += "--test-block"
-        $AgentArgs += "$Target"
+        $AgentArgs += $TargetStr
         $AgentArgs += "--allow-non-root"
     }
     "Install" {
-        if ([string]::IsNullOrWhiteSpace($Target)) {
+        if ([string]::IsNullOrWhiteSpace($TargetStr)) {
             Write-Err "Missing -Target parameter for Install action (e.g. -Target 'C:\path\to\setup.msi')."
             exit 1
         }
         $AgentArgs += "--pkg"
-        $AgentArgs += "$Target"
+        $AgentArgs += $TargetStr
     }
     "Daemon" {
         $AgentArgs += "--poll-interval"
@@ -243,14 +246,18 @@ if ($RequiresElevation -and -not $IsAdmin) {
     Write-Warn "This operation requires Administrator privileges."
     Write-Info "Re-launching script in an elevated PowerShell session..."
     
-    $ArgList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action $Action"
-    if ($Target) { $ArgList += " -Target `"$Target`"" }
-    if ($OrgId) { $ArgList += " -OrgId $OrgId" }
-    if ($DeviceId) { $ArgList += " -DeviceId `"$DeviceId`"" }
-    if ($ControlPlaneUrl) { $ArgList += " -ControlPlaneUrl `"$ControlPlaneUrl`"" }
-    if ($PollInterval) { $ArgList += " -PollInterval $PollInterval" }
+    $EscapedScript = $PSCommandPath.Replace('"', '\"')
+    $ElevatedArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$EscapedScript`" -Action $Action"
+    if (-not [string]::IsNullOrWhiteSpace($TargetStr)) { 
+        $CleanTarget = $TargetStr.Replace('"', '\"')
+        $ElevatedArgs += " -Target `"$CleanTarget`"" 
+    }
+    if ($OrgId) { $ElevatedArgs += " -OrgId $OrgId" }
+    if ($DeviceId) { $ElevatedArgs += " -DeviceId `"$DeviceId`"" }
+    if ($ControlPlaneUrl) { $ElevatedArgs += " -ControlPlaneUrl `"$ControlPlaneUrl`"" }
+    if ($PollInterval) { $ElevatedArgs += " -PollInterval $PollInterval" }
 
-    Start-Process powershell -Verb RunAs -ArgumentList $ArgList
+    Start-Process powershell -Verb RunAs -ArgumentList $ElevatedArgs
     exit 0
 }
 
