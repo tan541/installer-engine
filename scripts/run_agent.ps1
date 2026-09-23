@@ -64,7 +64,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Flatten Target parameter if multiple tokens or quotes were split across arguments
-$TargetStr = if ($Target -is [array]) { ($Target -join " ").Trim('"').Trim('\'') } else { [string]$Target }
+$TargetStr = if ($Target -is [array]) {
+    ($Target -join " ").Trim().Trim('"').Trim("'")
+} else {
+    ([string]$Target).Trim().Trim('"').Trim("'")
+}
 
 # Paths
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -245,19 +249,35 @@ if ($AllowNonRoot) {
 if ($RequiresElevation -and -not $IsAdmin) {
     Write-Warn "This operation requires Administrator privileges."
     Write-Info "Re-launching script in an elevated PowerShell session..."
-    
-    $EscapedScript = $PSCommandPath.Replace('"', '\"')
-    $ElevatedArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$EscapedScript`" -Action $Action"
-    if (-not [string]::IsNullOrWhiteSpace($TargetStr)) { 
-        $CleanTarget = $TargetStr.Replace('"', '\"')
-        $ElevatedArgs += " -Target `"$CleanTarget`"" 
-    }
-    if ($OrgId) { $ElevatedArgs += " -OrgId $OrgId" }
-    if ($DeviceId) { $ElevatedArgs += " -DeviceId `"$DeviceId`"" }
-    if ($ControlPlaneUrl) { $ElevatedArgs += " -ControlPlaneUrl `"$ControlPlaneUrl`"" }
-    if ($PollInterval) { $ElevatedArgs += " -PollInterval $PollInterval" }
 
-    Start-Process powershell -Verb RunAs -ArgumentList $ElevatedArgs
+    $ElevatedArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $PSCommandPath,
+        "-Action", $Action
+    )
+    if (-not [string]::IsNullOrWhiteSpace($TargetStr)) {
+        $ElevatedArgs += "-Target"
+        $ElevatedArgs += $TargetStr
+    }
+    if ($OrgId) {
+        $ElevatedArgs += "-OrgId"
+        $ElevatedArgs += "$OrgId"
+    }
+    if ($DeviceId) {
+        $ElevatedArgs += "-DeviceId"
+        $ElevatedArgs += $DeviceId
+    }
+    if ($ControlPlaneUrl) {
+        $ElevatedArgs += "-ControlPlaneUrl"
+        $ElevatedArgs += $ControlPlaneUrl
+    }
+    if ($PollInterval) {
+        $ElevatedArgs += "-PollInterval"
+        $ElevatedArgs += "$PollInterval"
+    }
+
+    Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $ElevatedArgs
     exit 0
 }
 
