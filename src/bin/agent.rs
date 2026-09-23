@@ -610,7 +610,12 @@ async fn run_local_package_workflow(
         app_version: Some("latest".to_string()),
         download_url: format!("file://{}", abs_pkg_path.display()),
         expected_checksum: checksum,
-        installer_args: vec!["-target".to_string(), "/".to_string()],
+        installer_args: match Platform::current() {
+            Platform::MacOS => vec!["-target".to_string(), "/".to_string()],
+            Platform::Windows => vec!["/qn".to_string(), "/norestart".to_string()],
+            Platform::Linux => vec![],
+            _ => vec![],
+        },
         task_status: TaskStatus::New,
         error_message: None,
         created_at: chrono::Utc::now(),
