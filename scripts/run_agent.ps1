@@ -28,6 +28,9 @@
 .PARAMETER AllowNonRoot
     Allow running unprivileged without Administrator elevation
 
+.PARAMETER ExtraArguments
+    Catches any remaining arguments if quotes were stripped by cmd/powershell wrappers.
+
 .EXAMPLE
     .\scripts\run_agent.ps1 -Action Inventory
     .\scripts\run_agent.ps1 -Action TestBlock -Target "uTorrent"
@@ -42,8 +45,8 @@ param(
     [ValidateSet("Inventory", "InventoryJson", "SyncInventory", "TestBlock", "Install", "Daemon", "OneShot", "Build", "Help")]
     [string]$Action = "Help",
 
-    [Parameter(Position = 1, Mandatory = $false, ValueFromRemainingArguments = $true)]
-    [string[]]$Target = @(),
+    [Parameter(Position = 1, Mandatory = $false)]
+    [string]$Target = "",
 
     [Parameter(Mandatory = $false)]
     [uint64]$OrgId = 1,
@@ -58,17 +61,23 @@ param(
     [uint64]$PollInterval = 10,
 
     [Parameter(Mandatory = $false)]
-    [switch]$AllowNonRoot
+    [switch]$AllowNonRoot,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ExtraArguments = @()
 )
 
 $ErrorActionPreference = "Stop"
 
-# Flatten Target parameter if multiple tokens or quotes were split across arguments
-$TargetStr = if ($Target -is [array]) {
-    ($Target -join " ").Trim().Trim('"').Trim("'")
-} else {
-    ([string]$Target).Trim().Trim('"').Trim("'")
+# Reconstruct Target parameter if unquoted spaces or wrapper split tokens across parameters
+$AllTargetParts = @()
+if (-not [string]::IsNullOrWhiteSpace($Target)) {
+    $AllTargetParts += $Target
 }
+if ($ExtraArguments -and $ExtraArguments.Count -gt 0) {
+    $AllTargetParts += $ExtraArguments
+}
+$TargetStr = ($AllTargetParts -join " ").Trim().Trim('"').Trim("'")
 
 # Paths
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
