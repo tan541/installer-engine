@@ -378,6 +378,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_action(BlockAction::TerminateAndQuarantine),
                 BlockRule::new("rule-unapproved-remote", "Block unapproved VNC/AnyDesk", BlockRuleType::PatternName("*anydesk*".to_string()))
                     .with_action(BlockAction::TerminateAndQuarantine),
+                BlockRule::new("rule-firefox", "Block Mozilla Firefox Installation & Execution", BlockRuleType::PatternName("*firefox*".to_string()))
+                    .with_action(BlockAction::TerminateAndQuarantine),
             ],
             custom_notification_message: Some("This software has been blocked in accordance with organizational security policy.".to_string()),
             updated_at: chrono::Utc::now(),
